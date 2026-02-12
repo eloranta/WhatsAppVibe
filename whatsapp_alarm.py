@@ -87,7 +87,7 @@ def build_driver(cfg):
 
     # Use a safe absolute profile folder
     profile_path = os.path.abspath(cfg.chrome_user_data_dir)
-    #chrome_options.add_argument(f"--user-data-dir={profile_path}")
+    chrome_options.add_argument(f"--user-data-dir={profile_path}")
 
     # Optional: avoid automation detection oddities
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -113,48 +113,54 @@ def wait_for_whatsapp_ready(driver):
     print("[INFO] WhatsApp appears ready.")
 
 
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+
 def open_group_chat(driver, group_name: str):
     wait = WebDriverWait(driver, 60)
-
     print(f"[INFO] Opening group chat: {group_name}")
 
-    # Try multiple search box strategies (WhatsApp DOM changes often)
-    search_selectors = [
-        "//*[@aria-label='Search input textbox']",
-        "//div[@contenteditable='true'][@role='textbox']",
-        "//div[@contenteditable='true']"
-    ]
-
-    search = None
-    for selector in search_selectors:
+    # Try a few times because WhatsApp re-renders the list constantly
+    for attempt in range(1, 6):
         try:
-            search = wait.until(
-                EC.presence_of_element_located((By.XPATH, selector))
-            )
-            if search:
-                break
-        except:
+            # Click the search box (use stable aria label if present, else fallback)
+            try:
+                search = wait.until(EC.presence_of_element_located(
+                    (By.XPATH, "//*[@aria-label='Search input textbox']")
+                ))
+            except TimeoutException:
+                search = wait.until(EC.presence_of_element_located(
+                    (By.XPATH, "//div[@contenteditable='true'][@role='textbox']")
+                ))
+
+            search.click()
+            time.sleep(0.2)
+            search.send_keys(Keys.CONTROL, "a")
+            search.send_keys(Keys.BACKSPACE)
+            search.send_keys(group_name)
+            time.sleep(1.0)
+
+            # IMPORTANT: re-locate right before click (prevents stale click)
+            chat_xpath = f"//span[@title={repr(group_name)}]"
+            wait.until(EC.presence_of_element_located((By.XPATH, chat_xpath)))
+            chat = wait.until(EC.element_to_be_clickable((By.XPATH, chat_xpath)))
+            chat.click()
+
+            # Wait until message composer exists => chat opened
+            wait.until(EC.presence_of_element_located((By.XPATH, "//footer//div[@contenteditable='true']")))
+            print(f"[INFO] Group opened successfully on attempt {attempt}.")
+            return
+
+        except StaleElementReferenceException:
+            print(f"[WARN] Stale element (attempt {attempt}), retrying...")
+            time.sleep(0.6)
+            continue
+        except Exception as e:
+            print(f"[WARN] Open group failed (attempt {attempt}): {e}")
+            time.sleep(0.8)
             continue
 
-    if not search:
-        raise Exception("Could not find WhatsApp search box (DOM changed).")
+    raise RuntimeError("Could not open group chat after multiple retries. WhatsApp DOM likely changed.")
 
-    search.click()
-    time.sleep(0.3)
-    search.send_keys(Keys.CONTROL, "a")
-    search.send_keys(Keys.BACKSPACE)
-    search.send_keys(group_name)
-    time.sleep(1.0)
-
-    # Click chat by title
-    chat = wait.until(
-        EC.element_to_be_clickable((By.XPATH, f"//span[@title={repr(group_name)}]"))
-    )
-    chat.click()
-
-    time.sleep(1.0)
-
-    print("[INFO] Group opened successfully.")
 
 
 
@@ -181,7 +187,6 @@ def get_messages(driver):
     for b in blocks:
         try:
             meta = (b.get_attribute("data-pre-plain-text") or "").strip()
-
             # Sender from meta: "[HH:MM, DD/MM/YYYY] Name: "
             sender = "Unknown"
             if "] " in meta:
@@ -244,18 +249,23 @@ def main():
 
         print("[DEBUG] Monitoring started. New messages will print below.\n")
 
+        seen_ids = set()
+
+        # Seed with messages already on screen (so old history isn't dumped)
+        for msg_id, sender, text in get_messages(driver):
+            seen_ids.add(msg_id)
+
+        print(f"[DEBUG] Seeded {len(seen_ids)} existing messages. Waiting for new ones...\n")
+
         while True:
             scroll_chat_to_bottom(driver)
 
             msgs = get_messages(driver)
 
-            #print(f"[DEBUG] Blocks parsed into messages: {len(msgs)}")
-            if not msgs:
-                print("[DEBUG] Still got 0 messages. If you see messages on screen, DOM changed again.")
-                
-            for msg_id, sender, text in msgs:
-                if msg_id in seen_ids:
-                    continue
+            # Print new ones immediately (including the first one that arrives)
+            new_items = [(mid, s, t) for (mid, s, t) in msgs if mid not in seen_ids]
+
+            for msg_id, sender, text in new_items:
                 seen_ids.add(msg_id)
 
                 ts = time.strftime("%H:%M:%S")
@@ -267,7 +277,6 @@ def main():
                     play_alarm(cfg)
 
             time.sleep(cfg.poll_seconds)
-
     except KeyboardInterrupt:
         print("\n[INFO] Stopped by user.")
     except Exception as e:
